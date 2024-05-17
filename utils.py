@@ -15,6 +15,7 @@ from model import Classifier, OneHotCVAE
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import pathlib
+import matplotlib.pyplot as plt
 from collections import defaultdict
 from scipy.spatial.distance import jensenshannon
 
@@ -559,3 +560,172 @@ def evaluate_with_classifier(ckpt_path, classifier_path, classes_remembered, cla
         import shutil
         shutil.rmtree(sample_path)
     return cum_sum, entropy_cum_sum
+
+def generate_samples_specialized_model(ckpt_folder, ckpt_name, sample_path, classes_remembered, classes_not_remembered, n_samples=100, batch_size=32):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ckpt = torch.load(os.path.join(ckpt_folder, ckpt_name), map_location=device)
+    config = ckpt['config']
+    print(ckpt.keys())
+    # build model
+    vae = OneHotCVAE(x_dim=config.x_dim, h_dim1= 512, h_dim2=256, z_dim=config.z_dim)
+    vae = vae.to(device)
+    
+    vae.load_state_dict(ckpt['model'])
+    vae.eval()
+    
+    for cls in classes_remembered:
+        sample_dir = os.path.join(sample_path, f"{cls}_samples")
+        print("sample_dir ", sample_dir)
+        if not os.path.exists(sample_dir):
+            os.makedirs(sample_dir, exist_ok=True)
+        i = 0
+        with torch.no_grad():
+            for _ in tqdm.tqdm(range((n_samples // batch_size)*batch_size)):
+                z = torch.randn((batch_size, config.z_dim)).to(device)
+                c = (torch.ones(batch_size, dtype=int) * cls).to(device)
+                c = F.one_hot(c, 10)
+                samples = vae.decoder(z, c).view(-1, 1, 28, 28)
+                for x in samples:
+                    save_image(x, os.path.join(sample_dir, f'{i}.png'))
+                    i += 1
+    for cls in classes_not_remembered:
+        sample_dir = os.path.join(sample_path, f"{cls}_samples")
+        print("sample_dir ", sample_dir)
+        if not os.path.exists(sample_dir):
+            os.makedirs(sample_dir, exist_ok=True)
+        i = 0
+        with torch.no_grad():
+            for _ in tqdm.tqdm(range((n_samples //batch_size)*batch_size)):
+                z = torch.randn((batch_size, config.z_dim)).to(device)
+                c = (torch.ones(batch_size, dtype=int) * cls).to(device)
+                c = F.one_hot(c, 10)
+                samples = vae.decoder(z, c).view(-1, 1, 28, 28)
+                for x in samples:
+                    save_image(x, os.path.join(sample_dir, f'{i}.png'))
+                    i += 1
+
+def evaluate_against_specialized(run_dir, ckpt_name, classifier_path, classes_remembered, classes_not_remembered, metric_paths=None, clean=True, batch_size=32):
+    sample_path = os.path.join("./adi", run_dir, "samples")
+    ckpt_folder = os.path.join("./adi", run_dir, "mnist", "initial", "ckpts")
+    generate_samples_specialized_model(ckpt_folder, ckpt_name, sample_path, classes_remembered, classes_not_remembered, n_samples=2000, batch_size=1)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ensemble_models = []
+    model_list = os.listdir(classifier_path)
+    for path in model_list:
+        model = Classifier(output_dim=10)
+        ckpt = torch.load(os.path.join("./classifier_ckpts", path), map_location=device)
+        model.load_state_dict(ckpt)
+        model = model.to(device)
+        model.eval()
+        ensemble_models.append(model)
+
+    cum_sum = {
+        0:0,
+        1:0,
+        2:0,
+        3:0,
+        4:0,
+        5:0,
+        6:0,
+        7:0,
+        8:0,
+        9:0,
+        10:0,
+    }
+
+    loader = GetImageFolderLoader(sample_path, batch_size=1)
+    n_samples = len(loader.dataset)
+    print("total samples ", n_samples)
+    for data, label in tqdm.tqdm(iter(loader), total=n_samples):
+        preds = []
+        for model in ensemble_models:
+            log_probs = model(data.to(device))
+            probs = log_probs.exp()
+            preds.append(probs.argmax().item())
+        
+        # check if all the predictions are the same
+        if all(pred == preds[0] for pred in preds) and preds[0] == int(label[0]):
+            cum_sum[preds[0]] += 1
+    for cls in cum_sum:
+        cum_sum[cls] = (cum_sum[cls]/ ((n_samples))) * (len(classes_not_remembered) + len(classes_remembered))
+        if cls in classes_remembered:
+            print(f"REM    : Class {cls} : {cum_sum[cls]}")
+        else : 
+            print(f"FORGOT : Class {cls} : {cum_sum[cls]}")
+    
+    metric_folder = os.path.join("./adi", run_dir, "metrics", ckpt_name[:-3])
+    print(metric_folder)
+    if not os.path.exists(metric_folder):
+        os.makedirs(metric_folder, exist_ok=True)
+    acc_path = os.path.join(metric_folder, "specialized_acc.csv")
+    # Initialize DataFrame either by reading the existing file or creating a new one
+    if not os.path.exists(acc_path):
+        df = pd.DataFrame(columns=['Ideal', 'Actual'])
+    else:
+        df = pd.read_csv(acc_path)
+
+    new_row = pd.DataFrame({'Ideal': [len(classes_remembered)], 'Actual': [sum(cum_sum[cls] for cls in classes_remembered)]})
+    df = pd.concat([df, new_row], ignore_index=True)
+    df.to_csv(acc_path, index=False)
+    
+    accuracy_values = os.path.join(metric_folder, "specialized_accuracy_vals.csv")
+    if not os.path.exists(accuracy_values):
+        df = pd.DataFrame(columns=['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'])
+    else:
+        df = pd.read_csv(accuracy_values)
+    
+    new_row = pd.DataFrame({'0': [cum_sum[0]], '1': [cum_sum[1]], '2': [cum_sum[2]], '3': [cum_sum[3]], '4': [cum_sum[4]], '5': [cum_sum[5]], '6': [cum_sum[6]], '7': [cum_sum[7]], '8': [cum_sum[8]], '9': [cum_sum[9]]})
+    df = pd.concat([df, new_row], ignore_index=True)
+    df.to_csv(accuracy_values, index=False)
+
+    # remove the samples folder
+    if clean:
+        import shutil
+        shutil.rmtree(sample_path)
+    return cum_sum
+
+def draw_graphs(metrics_dir, specialized_model_type, row_num, plot_type):
+    if plot_type == 0: # for comparative plots
+        specialized_csv = os.path.join(metrics_dir, specialized_model_type, "specialized_accuracy_vals.csv")
+        our_csv = os.path.join(metrics_dir, "accuracy_values.csv")
+        spec_acc = pd.read_csv(specialized_csv)
+        our_acc = pd.read_csv(our_csv)
+        req_row = our_acc.iloc[row_num]
+        # print(req_row)
+        combined_df = pd.DataFrame({
+            'Simple Model': spec_acc.iloc[0],
+            'Our Model': req_row
+        })
+        fig, ax = plt.subplots()
+        combined_df.plot(kind='bar', ax=ax, color=['skyblue', 'orange'])
+        ax.set_title('Accuracy Comparison of Models')
+        ax.set_xlabel('Class Label')
+        ax.set_ylabel('Accuracy')
+        ax.set_xticklabels(combined_df.index, rotation=0)
+        ax.legend(title='Legend', bbox_to_anchor=(1.15, 1), loc='upper left')
+        plt.tight_layout(rect=[0, 0, 1, 1])
+        plt.legend()
+        plt.savefig(os.path.join(metrics_dir, f"{specialized_model_type[-5:]}.png"), format='png', bbox_inches='tight')
+        
+    if plot_type == 1: # for plotting accuracy over time
+        df = pd.read_csv(os.path.join(metrics_dir, "acc.csv"))
+        df['Actual'] = df['Actual'] / df['Ideal']
+        df = df['Actual']
+        
+        plt.figure()
+        df.plot(kind='line')
+        plt.title('Variation of accuracy with number of passes')
+        plt.xlabel('Pass Number')
+        plt.ylabel('Accuracy')
+        plt.xticks(range(len(df.index)), df.index + 1)
+        plt.ylim(0.6,1)
+        plt.savefig(os.path.join(metrics_dir, "accuracy_variation.png"), format='png', bbox_inches='tight')
+    
+
+if __name__=="__main__":
+    # classes_remembered = [0,8] #Fill in
+    # classes_not_remembered = []
+    # evaluate_against_specialized("run5_10", "specialized_model.pt", "./classifier_ckpts", classes_remembered, classes_not_remembered)
+
+    # row_num = 4 for short, 10 for long
+    draw_graphs("./adi/run1_10/metrics", "specialized_model", 10, 1)
